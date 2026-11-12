@@ -1,0 +1,51 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "prices",
+	"main": "src/worker.js",
+	"compatibility_date": "2026-11-12",
+	"cache": {
+		"enabled": true
+	},
+	"exports": {
+		"default": {
+			"type": "worker",
+			"cache": {
+				"enabled": false
+			}
+		},
+		"CachedPrices": {
+			"type": "worker",
+			"cache": {
+				"enabled": true
+			}
+		}
+	},
+	"triggers": {
+		"crons": [
+			"* * * * *"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "radix-price-minimal",
+			"database_id": "9997acc0-0ee1-40be-8c62-c9616b771c74"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "GATEWAY_COORDINATOR",
+				"class_name": "GatewayCoordinator"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"GatewayCoordinator"
+			]
+		}
+	]
+}

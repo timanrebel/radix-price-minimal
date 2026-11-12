@@ -10,3 +10,8 @@ minprice.env
 tokens.pruned.json
  
 __pycache__/
+
+# Cloudflare Workers
+node_modules/
+.wrangler/
+.dev.vars*

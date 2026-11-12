@@ -1,13 +1,83 @@
 # minprice
 
-A minimal Radix token price service. It is a single Python process: stdlib only, no `pip install`, SQLite for storage, and a background thread that recomputes prices every `INTERVAL_SECS`. Its JSON API is compatible with `radixdlt/token-pricing-service`, so the Radix Wallet can use it as a price source.
+A minimal Radix token price service for the Radix Wallet. The Cloudflare Worker and the original Python service expose the same JSON API.
 
 | Endpoint | Notes |
 |---|---|
 | `POST /price/tokens` (and `-legacy`) | `{"currency":"USD","tokens":[...],"lsus":[...]}` → `{"tokens":[...],"lsus":[...]}` |
-| `POST /price/historicalPrice` (and `-legacy`) | Requires the `x-api-key` header. Returns the closest sample within ±1 day; 424 if any token is missing. |
+| `POST /price/historicalPrice` (and `-legacy`) | Requires the `x-api-key` header. Returns the closest sample in the UTC day of the timestamp or either adjacent day. Returns 424 if any token is missing. |
 | `POST /tokens` | Configured tokens with their current price. |
-| `GET /healthz` | Returns 503 if the last successful cycle is older than 5 × the interval. |
+| `GET /healthz` | Returns 503 when there is no successful refresh or the last success is at least 5 × the refresh interval old. |
+
+## Cloudflare Worker
+
+A Cron Trigger refreshes the configured pools every minute and writes the latest snapshot and five-minute historical samples to D1. A failed refresh keeps the last successful prices available and records the error in `/healthz`.
+
+The public price routes use POST. The Worker reads its current snapshot and LSU redemption values through internal GETs served by Workers Cache. Snapshot reads are cached for 15 seconds by default. The Worker reuses LSU redemption values for up to five minutes, even when requests contain different combinations of addresses. A single Durable Object coordinates cache misses across locations and serializes Gateway lookups for LSU batches. The historical and health routes read directly from D1. Wallet traffic never triggers pool previews. [Cloudflare Workers Cache examples](https://developers.cloudflare.com/workers/cache/examples/)
+
+### Run locally
+
+Use Node.js 22.12 or newer.
+
+```bash
+npm ci
+npx wrangler d1 migrations apply DB --local
+npm run dev
+```
+
+In another terminal, trigger the refresh and query the API.
+
+```bash
+curl -s 'http://localhost:8787/__scheduled?cron=*+*+*+*+*'
+curl -s http://localhost:8787/healthz
+curl -s -X POST http://localhost:8787/price/tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"currency":"USD","tokens":["resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd"]}'
+```
+
+The local Worker uses the public Radix Gateway and CoinGecko by default. Set `GATEWAY_URL` or `COINGECKO_URL` in `.dev.vars` to override them. Set `API_KEY` there to enable local historical requests.
+
+### Deploy
+
+Create the database, then add the returned `database_id` to the existing `DB` binding in [wrangler.jsonc](wrangler.jsonc).
+
+```bash
+npx wrangler d1 create radix-price-minimal
+npx wrangler d1 migrations apply DB --remote
+npm run deploy
+```
+
+To enable historical requests, set the secret after deploying. Reuse the existing API key if clients already have it configured.
+
+```bash
+npx wrangler secret put API_KEY
+```
+
+The first successful scheduled refresh populates an empty D1 database. Point the wallet at the deployed HTTPS URL once `/healthz` returns 200. Edit `tokens.json` and redeploy to change the token list. If you change the cron schedule, set `INTERVAL_SECS` to match so the health check uses the new interval.
+
+### Import existing prices and history
+
+After applying the D1 migration and before deploying against the new database, you can import the `latest` and `history` tables from the existing SQLite file.
+
+```bash
+sqlite3 -readonly /path/to/minprice.db > /tmp/radix-price-import.sql <<'SQL'
+BEGIN;
+.mode insert latest
+SELECT resource_address, usd_price, last_updated_at, price_source FROM latest;
+.mode insert history
+SELECT resource_address, ts, usd_price FROM history;
+ROLLBACK;
+SQL
+npx wrangler d1 execute DB --remote --file /tmp/radix-price-import.sql
+```
+
+The local read transaction keeps the export consistent. D1 starts reporting a healthy refresh after its first successful cycle.
+
+### Worker settings
+
+Set production overrides in `wrangler.jsonc` under `vars`. `GATEWAY_URL`, `COINGECKO_URL`, `HISTORY_EVERY_SECS`, `RETENTION_DAYS`, and `PLAZA_PROBE_QUOTE` use the defaults listed below. `PRICE_CACHE_SECS` defaults to 15 and `LSU_CACHE_SECS` defaults to 300.
+
+## Pricing and Python service
 
 Prices are computed with the same algorithm as the original `ledger_current_price` DAG:
 
@@ -15,7 +85,7 @@ Prices are computed with the same algorithm as the original `ledger_current_pric
 2. A token's ledger price is the average over its pools.
 3. Tokens with a `coingecko_id` are blended as `weight × CoinGecko + (1 − weight) × ledger`, with a divergence check and an expiring CoinGecko cache.
 
-## Configuration (environment)
+### Python configuration (environment)
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -99,6 +169,14 @@ The wallet requires HTTPS with a valid certificate. Keep minprice on `127.0.0.1`
 Then add `https://YOUR_HOST/` as a token price service URL in the wallet.
 
 ## Tests
+
+Run the Worker integration checks against a mocked Gateway and a local D1 database.
+
+```bash
+python3 tests/worker_integration.py
+```
+
+Run the original Python service tests.
 
 ```bash
 python3 -m unittest -v test_minprice     # mocked Gateway and CoinGecko
